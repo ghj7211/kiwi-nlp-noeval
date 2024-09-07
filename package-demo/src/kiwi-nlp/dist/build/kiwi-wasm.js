@@ -93,14 +93,13 @@ var kiwi = (() => {
         }
         readAsync = (url) => {
           if (isFileURI(url)) {
-            return new Promise((resolve, reject) => {
+            return new Promise((reject, resolve) => {
               var xhr = new XMLHttpRequest();
               xhr.open("GET", url, true);
               xhr.responseType = "arraybuffer";
               xhr.onload = () => {
                 if (xhr.status == 200 || (xhr.status == 0 && xhr.response)) {
                   resolve(xhr.response);
-                  return;
                 }
                 reject(xhr.status);
               };
@@ -126,7 +125,9 @@ var kiwi = (() => {
     moduleOverrides = null;
     if (Module["arguments"]) arguments_ = Module["arguments"];
     if (Module["thisProgram"]) thisProgram = Module["thisProgram"];
-    var wasmBinary = Module["wasmBinary"];
+    if (Module["quit"]) quit_ = Module["quit"];
+    var wasmBinary;
+    if (Module["wasmBinary"]) wasmBinary = Module["wasmBinary"];
     var wasmMemory;
     var ABORT = false;
     var EXITSTATUS;
@@ -158,7 +159,7 @@ var kiwi = (() => {
     }
     function initRuntime() {
       runtimeInitialized = true;
-      if (!Module["noFSInit"] && !FS.initialized) FS.init();
+      if (!Module["noFSInit"] && !FS.init.initialized) FS.init();
       FS.ignorePermissions = false;
       TTY.init();
       callRuntimeCallbacks(__ATINIT__);
@@ -373,6 +374,15 @@ var kiwi = (() => {
       }
       get_adjusted_ptr() {
         return HEAPU32[(this.ptr + 16) >> 2];
+      }
+      get_exception_ptr() {
+        var isPointer = ___cxa_is_pointer_type(this.get_type());
+        if (isPointer) {
+          return HEAPU32[this.excPtr >> 2];
+        }
+        var adjusted = this.get_adjusted_ptr();
+        if (adjusted !== 0) return adjusted;
+        return this.excPtr;
       }
     }
     var exceptionLast = 0;
@@ -1084,29 +1094,27 @@ var kiwi = (() => {
           var ptr;
           var allocated;
           var contents = stream.node.contents;
-          if (!(flags & 2) && contents && contents.buffer === HEAP8.buffer) {
+          if (!(flags & 2) && contents.buffer === HEAP8.buffer) {
             allocated = false;
             ptr = contents.byteOffset;
           } else {
+            if (position > 0 || position + length < contents.length) {
+              if (contents.subarray) {
+                contents = contents.subarray(position, position + length);
+              } else {
+                contents = Array.prototype.slice.call(
+                  contents,
+                  position,
+                  position + length
+                );
+              }
+            }
             allocated = true;
             ptr = mmapAlloc(length);
             if (!ptr) {
               throw new FS.ErrnoError(48);
             }
-            if (contents) {
-              if (position > 0 || position + length < contents.length) {
-                if (contents.subarray) {
-                  contents = contents.subarray(position, position + length);
-                } else {
-                  contents = Array.prototype.slice.call(
-                    contents,
-                    position,
-                    position + length
-                  );
-                }
-              }
-              HEAP8.set(contents, ptr);
-            }
+            HEAP8.set(contents, ptr);
           }
           return { ptr: ptr, allocated: allocated };
         },
@@ -2175,9 +2183,6 @@ var kiwi = (() => {
         if (!stream.stream_ops.mmap) {
           throw new FS.ErrnoError(43);
         }
-        if (!length) {
-          throw new FS.ErrnoError(28);
-        }
         return stream.stream_ops.mmap(stream, length, position, prot, flags);
       },
       msync(stream, buffer, offset, length, mmapFlags) {
@@ -2304,19 +2309,19 @@ var kiwi = (() => {
           "/proc/self/fd"
         );
       },
-      createStandardStreams(input, output, error) {
-        if (input) {
-          FS.createDevice("/dev", "stdin", input);
+      createStandardStreams() {
+        if (Module["stdin"]) {
+          FS.createDevice("/dev", "stdin", Module["stdin"]);
         } else {
           FS.symlink("/dev/tty", "/dev/stdin");
         }
-        if (output) {
-          FS.createDevice("/dev", "stdout", null, output);
+        if (Module["stdout"]) {
+          FS.createDevice("/dev", "stdout", null, Module["stdout"]);
         } else {
           FS.symlink("/dev/tty", "/dev/stdout");
         }
-        if (error) {
-          FS.createDevice("/dev", "stderr", null, error);
+        if (Module["stderr"]) {
+          FS.createDevice("/dev", "stderr", null, Module["stderr"]);
         } else {
           FS.symlink("/dev/tty1", "/dev/stderr");
         }
@@ -2337,16 +2342,14 @@ var kiwi = (() => {
         FS.filesystems = { MEMFS: MEMFS };
       },
       init(input, output, error) {
-        FS.initialized = true;
-        input !== null && input !== void 0 ? input : (input = Module["stdin"]);
-        output !== null && output !== void 0
-          ? output
-          : (output = Module["stdout"]);
-        error !== null && error !== void 0 ? error : (error = Module["stderr"]);
-        FS.createStandardStreams(input, output, error);
+        FS.init.initialized = true;
+        Module["stdin"] = input || Module["stdin"];
+        Module["stdout"] = output || Module["stdout"];
+        Module["stderr"] = error || Module["stderr"];
+        FS.createStandardStreams();
       },
       quit() {
-        FS.initialized = false;
+        FS.init.initialized = false;
         for (var i = 0; i < FS.streams.length; i++) {
           var stream = FS.streams[i];
           if (!stream) {
@@ -3095,6 +3098,11 @@ var kiwi = (() => {
       }
     }
     function registerType(rawType, registeredInstance, options = {}) {
+      if (!("argPackAdvance" in registeredInstance)) {
+        throw new TypeError(
+          "registerType registeredInstance requires argPackAdvance"
+        );
+      }
       return sharedRegisterType(rawType, registeredInstance, options);
     }
     var GenericWireTypeSize = 8;
@@ -3224,60 +3232,95 @@ var kiwi = (() => {
       }
       return false;
     }
-    var InvokerFunctions = {
-      ftft: function (
-        humanName,
-        throwBindingError,
-        invoker,
-        fn,
-        runDestructors,
-        retType,
-        classParam,
-        argType0,
-        arg0Wired_dtor
-      ) {
-        return function (arg0) {
-          if (arguments.length !== 1) {
-            throwBindingError(
-              "function " +
-                humanName +
-                " called with " +
-                arguments.length +
-                " arguments, expected 1"
-            );
-          }
-          var arg0Wired = argType0["toWireType"](null, arg0);
-          var rv = invoker(fn, arg0Wired);
-          arg0Wired_dtor(arg0Wired);
-          var ret = retType["fromWireType"](rv);
-          return ret;
-        };
-      },
-    };
-    function createJsInvokerSignature(
-      argTypes,
-      isClassMethodFunc,
-      returns,
-      isAsync
-    ) {
-      const signature = [
-        isClassMethodFunc ? "t" : "f",
-        returns ? "t" : "f",
-        isAsync ? "t" : "f",
-      ];
-      for (let i = isClassMethodFunc ? 1 : 2; i < argTypes.length; ++i) {
-        const arg = argTypes[i];
-        let destructorSig = "";
-        if (arg.destructorFunction === undefined) {
-          destructorSig = "u";
-        } else if (arg.destructorFunction === null) {
-          destructorSig = "n";
-        } else {
-          destructorSig = "t";
-        }
-        signature.push(destructorSig);
+    function newFunc(constructor, argumentList) {
+      if (!(constructor instanceof Function)) {
+        throw new TypeError(
+          `new_ called with constructor type ${typeof constructor} which is not a function`
+        );
       }
-      return signature.join("");
+      var dummy = createNamedFunction(
+        constructor.name || "unknownFunctionName",
+        function () {}
+      );
+      dummy.prototype = constructor.prototype;
+      var obj = new dummy();
+      var r = constructor.apply(obj, argumentList);
+      return r instanceof Object ? r : obj;
+    }
+    function createJsInvoker(argTypes, isClassMethodFunc, returns, isAsync) {
+      var needsDestructorStack = usesDestructorStack(argTypes);
+      var argCount = argTypes.length;
+      var argsList = "";
+      var argsListWired = "";
+      for (var i = 0; i < argCount - 2; ++i) {
+        argsList += (i !== 0 ? ", " : "") + "arg" + i;
+        argsListWired += (i !== 0 ? ", " : "") + "arg" + i + "Wired";
+      }
+      var invokerFnBody = `\n        return function (${argsList}) {\n        if (arguments.length !== ${
+        argCount - 2
+      }) {\n          throwBindingError('function ' + humanName + ' called with ' + arguments.length + ' arguments, expected ${
+        argCount - 2
+      }');\n        }`;
+      if (needsDestructorStack) {
+        invokerFnBody += "var destructors = [];\n";
+      }
+      var dtorStack = needsDestructorStack ? "destructors" : "null";
+      var args1 = [
+        "humanName",
+        "throwBindingError",
+        "invoker",
+        "fn",
+        "runDestructors",
+        "retType",
+        "classParam",
+      ];
+      if (isClassMethodFunc) {
+        invokerFnBody +=
+          "var thisWired = classParam['toWireType'](" +
+          dtorStack +
+          ", this);\n";
+      }
+      for (var i = 0; i < argCount - 2; ++i) {
+        invokerFnBody +=
+          "var arg" +
+          i +
+          "Wired = argType" +
+          i +
+          "['toWireType'](" +
+          dtorStack +
+          ", arg" +
+          i +
+          ");\n";
+        args1.push("argType" + i);
+      }
+      if (isClassMethodFunc) {
+        argsListWired =
+          "thisWired" + (argsListWired.length > 0 ? ", " : "") + argsListWired;
+      }
+      invokerFnBody +=
+        (returns || isAsync ? "var rv = " : "") +
+        "invoker(fn" +
+        (argsListWired.length > 0 ? ", " : "") +
+        argsListWired +
+        ");\n";
+      if (needsDestructorStack) {
+        invokerFnBody += "runDestructors(destructors);\n";
+      } else {
+        for (var i = isClassMethodFunc ? 1 : 2; i < argTypes.length; ++i) {
+          var paramName = i === 1 ? "thisWired" : "arg" + (i - 2) + "Wired";
+          if (argTypes[i].destructorFunction !== null) {
+            invokerFnBody += `${paramName}_dtor(${paramName});\n`;
+            args1.push(`${paramName}_dtor`);
+          }
+        }
+      }
+      if (returns) {
+        invokerFnBody +=
+          "var ret = retType['fromWireType'](rv);\n" + "return ret;\n";
+      } else {
+      }
+      invokerFnBody += "}\n";
+      return [args1, invokerFnBody];
     }
     function craftInvokerFunction(
       humanName,
@@ -3315,13 +3358,14 @@ var kiwi = (() => {
           }
         }
       }
-      var signature = createJsInvokerSignature(
+      let [args, invokerFnBody] = createJsInvoker(
         argTypes,
         isClassMethodFunc,
         returns,
         isAsync
       );
-      var invokerFn = InvokerFunctions[signature](...closureArgs);
+      args.push(invokerFnBody);
+      var invokerFn = newFunc(Function, args)(...closureArgs);
       return createNamedFunction(humanName, invokerFn);
     }
     var ensureOverloadTable = (proto, methodName, humanName) => {
@@ -3926,15 +3970,15 @@ var kiwi = (() => {
       var stdTimezoneOffset = Math.max(winterOffset, summerOffset);
       HEAPU32[timezone >> 2] = stdTimezoneOffset * 60;
       HEAP32[daylight >> 2] = Number(winterOffset != summerOffset);
-      var extractZone = (timezoneOffset) => {
-        var sign = timezoneOffset >= 0 ? "-" : "+";
-        var absOffset = Math.abs(timezoneOffset);
-        var hours = String(Math.floor(absOffset / 60)).padStart(2, "0");
-        var minutes = String(absOffset % 60).padStart(2, "0");
-        return `UTC${sign}${hours}${minutes}`;
-      };
-      var winterName = extractZone(winterOffset);
-      var summerName = extractZone(summerOffset);
+      var extractZone = (date) =>
+        date
+          .toLocaleTimeString(undefined, {
+            hour12: false,
+            timeZoneName: "short",
+          })
+          .split(" ")[1];
+      var winterName = extractZone(winter);
+      var summerName = extractZone(summer);
       if (summerOffset < winterOffset) {
         stringToUTF8(winterName, std_name, 17);
         stringToUTF8(summerName, dst_name, 17);
@@ -3961,6 +4005,8 @@ var kiwi = (() => {
       if (requestedSize > maxHeapSize) {
         return false;
       }
+      var alignUp = (x, multiple) =>
+        x + ((multiple - (x % multiple)) % multiple);
       for (var cutDown = 1; cutDown <= 4; cutDown *= 2) {
         var overGrownHeapSize = oldSize * (1 + 0.2 / cutDown);
         overGrownHeapSize = Math.min(
@@ -3969,7 +4015,7 @@ var kiwi = (() => {
         );
         var newSize = Math.min(
           maxHeapSize,
-          alignMemory(Math.max(requestedSize, overGrownHeapSize), 65536)
+          alignUp(Math.max(requestedSize, overGrownHeapSize), 65536)
         );
         var replacement = growMemory(newSize);
         if (replacement) {
@@ -4107,9 +4153,6 @@ var kiwi = (() => {
         var curr = FS.write(stream, HEAP8, ptr, len, offset);
         if (curr < 0) return -1;
         ret += curr;
-        if (curr < len) {
-          break;
-        }
         if (typeof offset != "undefined") {
           offset += curr;
         }
@@ -4192,6 +4235,8 @@ var kiwi = (() => {
     var _free = (a0) => (_free = wasmExports["N"])(a0);
     var _emscripten_builtin_memalign = (a0, a1) =>
       (_emscripten_builtin_memalign = wasmExports["O"])(a0, a1);
+    var ___cxa_is_pointer_type = (a0) =>
+      (___cxa_is_pointer_type = wasmExports["P"])(a0);
     var dynCall_viijii = (Module["dynCall_viijii"] = (
       a0,
       a1,
@@ -4201,7 +4246,7 @@ var kiwi = (() => {
       a5,
       a6
     ) =>
-      (dynCall_viijii = Module["dynCall_viijii"] = wasmExports["P"])(
+      (dynCall_viijii = Module["dynCall_viijii"] = wasmExports["Q"])(
         a0,
         a1,
         a2,
@@ -4211,7 +4256,7 @@ var kiwi = (() => {
         a6
       ));
     var dynCall_jiji = (Module["dynCall_jiji"] = (a0, a1, a2, a3, a4) =>
-      (dynCall_jiji = Module["dynCall_jiji"] = wasmExports["Q"])(
+      (dynCall_jiji = Module["dynCall_jiji"] = wasmExports["R"])(
         a0,
         a1,
         a2,
@@ -4227,7 +4272,7 @@ var kiwi = (() => {
       a5,
       a6
     ) =>
-      (dynCall_iiiiij = Module["dynCall_iiiiij"] = wasmExports["R"])(
+      (dynCall_iiiiij = Module["dynCall_iiiiij"] = wasmExports["S"])(
         a0,
         a1,
         a2,
@@ -4247,7 +4292,7 @@ var kiwi = (() => {
       a7,
       a8
     ) =>
-      (dynCall_iiiiijj = Module["dynCall_iiiiijj"] = wasmExports["S"])(
+      (dynCall_iiiiijj = Module["dynCall_iiiiijj"] = wasmExports["T"])(
         a0,
         a1,
         a2,
@@ -4270,7 +4315,7 @@ var kiwi = (() => {
       a8,
       a9
     ) =>
-      (dynCall_iiiiiijj = Module["dynCall_iiiiiijj"] = wasmExports["T"])(
+      (dynCall_iiiiiijj = Module["dynCall_iiiiiijj"] = wasmExports["U"])(
         a0,
         a1,
         a2,

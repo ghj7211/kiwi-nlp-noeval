@@ -1,4 +1,4 @@
-import { AsyncMethods } from 'kiwi-nlp/dist/util.js';
+import { AsyncMethods } from './util.js';
 /**
  * Describes a single morpheme in the input string of the morphological analysis.
  */

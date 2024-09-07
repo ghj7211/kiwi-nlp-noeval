@@ -1,5 +1,5 @@
-import { Kiwi } from 'kiwi-nlp/dist/kiwi.js';
-import { BuildArgs } from 'kiwi-nlp/dist/build-args.js';
+import { Kiwi } from './kiwi.js';
+import { BuildArgs } from './build-args.js';
 /**
  * Used to create Kiwi instances. Main entry point for the API.
  * It is recommended to create a KiwiBuilder and the Kiwi instances in a worker to prevent blocking the main thread.
